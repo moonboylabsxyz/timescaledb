@@ -2941,8 +2941,15 @@ decompress_batches(RowDecompressor *decompressor, ScanKeyData *scankeys, int num
 			table_endscan(scan);
 			report_error(result);
 		}
-		row_decompressor_decompress_row_to_table(decompressor);
-		*chunk_status_changed = true;
+		if (decompressor->delete_only)
+		{
+			decompressor->batches_deleted++;
+		}
+		else
+		{
+			row_decompressor_decompress_row_to_table(decompressor);
+			*chunk_status_changed = true;
+		}
 	}
 	if (scankeys)
 		pfree(scankeys);
@@ -3123,8 +3130,15 @@ decompress_batches_using_index(RowDecompressor *decompressor, Relation index_rel
 			index_close(index_rel, AccessShareLock);
 			report_error(result);
 		}
-		row_decompressor_decompress_row_to_table(decompressor);
-		*chunk_status_changed = true;
+		if (decompressor->delete_only)
+		{
+			decompressor->batches_deleted++;
+		}
+		else
+		{
+			row_decompressor_decompress_row_to_table(decompressor);
+			*chunk_status_changed = true;
+		}
 	}
 
 	if (ts_guc_debug_compression_path_info)
@@ -3139,6 +3153,96 @@ decompress_batches_using_index(RowDecompressor *decompressor, Relation index_rel
 	ExecDropSingleTupleTableSlot(slot);
 	index_endscan(scan);
 	CommandCounterIncrement();
+	return true;
+}
+
+static bool
+extract_operands(Node *node, Var **var, Const **arg_value)
+{
+	switch (nodeTag(node))
+	{
+		case T_OpExpr:
+		{
+			OpExpr *opexpr = (OpExpr *) node;
+
+			Expr *leftop = linitial(opexpr->args);
+			Expr *rightop = lsecond(opexpr->args);
+
+			if (IsA(leftop, RelabelType))
+				leftop = ((RelabelType *) leftop)->arg;
+			if (IsA(rightop, RelabelType))
+				rightop = ((RelabelType *) rightop)->arg;
+
+			if (IsA(leftop, Var) && IsA(rightop, Const))
+			{
+				*var = (Var *) leftop;
+				*arg_value = (Const *) rightop;
+				return true;
+			}
+			else if (IsA(rightop, Var) && IsA(leftop, Const))
+			{
+				*var = (Var *) rightop;
+				*arg_value = (Const *) leftop;
+				return true;
+			}
+			break;
+		}
+		case T_ScalarArrayOpExpr:
+		{
+			ScalarArrayOpExpr *opexpr = (ScalarArrayOpExpr *) node;
+
+			Expr *leftop = linitial(opexpr->args);
+			Expr *rightop = lsecond(opexpr->args);
+
+			if (IsA(leftop, RelabelType))
+				leftop = ((RelabelType *) leftop)->arg;
+			if (IsA(rightop, RelabelType))
+				rightop = ((RelabelType *) rightop)->arg;
+
+			if (IsA(leftop, Var) && IsA(rightop, Const))
+			{
+				*var = (Var *) leftop;
+				*arg_value = (Const *) rightop;
+				return true;
+			}
+			else if (IsA(rightop, Var) && IsA(leftop, Const))
+			{
+				*var = (Var *) rightop;
+				*arg_value = (Const *) leftop;
+				return true;
+			}
+			break;
+		}
+		default:
+			elog(NOTICE, "Unsupported node type %d", nodeTag(node));
+			break;
+	}
+
+	return false;
+}
+
+static bool
+can_delete_without_decompression(CompressionSettings *settings, Chunk *chunk, List *predicates)
+{
+	ListCell *lc;
+
+	foreach (lc, predicates)
+	{
+		Node *node = lfirst(lc);
+		Var *var;
+		Const *arg_value;
+
+		if (extract_operands(node, &var, &arg_value))
+		{
+			char *column_name = get_attname(chunk->table_id, var->varattno, false);
+			if (ts_array_is_member(settings->fd.segmentby, column_name))
+			{
+				continue;
+			}
+		}
+		return false;
+	}
+
 	return true;
 }
 
@@ -3182,6 +3286,12 @@ decompress_batches_for_update_delete(HypertableModifyState *ht_state, Chunk *chu
 	chunk_rel = table_open(chunk->table_id, RowExclusiveLock);
 	comp_chunk_rel = table_open(comp_chunk->table_id, RowExclusiveLock);
 	decompressor = build_decompressor(comp_chunk_rel, chunk_rel);
+
+	if (ht_state->mt->operation == CMD_DELETE &&
+		can_delete_without_decompression(settings, chunk, predicates))
+	{
+		decompressor.delete_only = true;
+	}
 
 	if (index_filters)
 	{
@@ -3243,6 +3353,7 @@ decompress_batches_for_update_delete(HypertableModifyState *ht_state, Chunk *chu
 		filter = lfirst(lc);
 		pfree(filter);
 	}
+	ht_state->batches_deleted += decompressor.batches_deleted;
 	ht_state->batches_decompressed += decompressor.batches_decompressed;
 	ht_state->tuples_decompressed += decompressor.tuples_decompressed;
 }
