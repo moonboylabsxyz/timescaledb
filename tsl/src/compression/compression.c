@@ -3157,71 +3157,6 @@ decompress_batches_using_index(RowDecompressor *decompressor, Relation index_rel
 }
 
 static bool
-extract_operands(Node *node, Var **var, Const **arg_value)
-{
-	switch (nodeTag(node))
-	{
-		case T_OpExpr:
-		{
-			OpExpr *opexpr = (OpExpr *) node;
-
-			Expr *leftop = linitial(opexpr->args);
-			Expr *rightop = lsecond(opexpr->args);
-
-			if (IsA(leftop, RelabelType))
-				leftop = ((RelabelType *) leftop)->arg;
-			if (IsA(rightop, RelabelType))
-				rightop = ((RelabelType *) rightop)->arg;
-
-			if (IsA(leftop, Var) && IsA(rightop, Const))
-			{
-				*var = (Var *) leftop;
-				*arg_value = (Const *) rightop;
-				return true;
-			}
-			else if (IsA(rightop, Var) && IsA(leftop, Const))
-			{
-				*var = (Var *) rightop;
-				*arg_value = (Const *) leftop;
-				return true;
-			}
-			break;
-		}
-		case T_ScalarArrayOpExpr:
-		{
-			ScalarArrayOpExpr *opexpr = (ScalarArrayOpExpr *) node;
-
-			Expr *leftop = linitial(opexpr->args);
-			Expr *rightop = lsecond(opexpr->args);
-
-			if (IsA(leftop, RelabelType))
-				leftop = ((RelabelType *) leftop)->arg;
-			if (IsA(rightop, RelabelType))
-				rightop = ((RelabelType *) rightop)->arg;
-
-			if (IsA(leftop, Var) && IsA(rightop, Const))
-			{
-				*var = (Var *) leftop;
-				*arg_value = (Const *) rightop;
-				return true;
-			}
-			else if (IsA(rightop, Var) && IsA(leftop, Const))
-			{
-				*var = (Var *) rightop;
-				*arg_value = (Const *) leftop;
-				return true;
-			}
-			break;
-		}
-		default:
-			elog(NOTICE, "Unsupported node type %d", nodeTag(node));
-			break;
-	}
-
-	return false;
-}
-
-static bool
 can_delete_without_decompression(CompressionSettings *settings, Chunk *chunk, List *predicates)
 {
 	ListCell *lc;
@@ -3230,10 +3165,15 @@ can_delete_without_decompression(CompressionSettings *settings, Chunk *chunk, Li
 	{
 		Node *node = lfirst(lc);
 		Var *var;
-		Const *arg_value;
+		Expr *arg_value;
+		Oid opno;
 
-		if (extract_operands(node, &var, &arg_value))
+		if (ts_extract_expr_args((Expr *) node, &var, &arg_value, &opno, NULL))
 		{
+			if (!IsA(arg_value, Const))
+			{
+				return false;
+			}
 			char *column_name = get_attname(chunk->table_id, var->varattno, false);
 			if (ts_array_is_member(settings->fd.segmentby, column_name))
 			{
